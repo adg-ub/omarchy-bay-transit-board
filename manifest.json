@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.adg-ub.bay-transit-board",
+  "name": "Bay Transit Board",
+  "version": "1.2.0",
+  "author": "Aditya Gupta",
+  "license": "MIT",
+  "description": "Unofficial Bay Area rapid-transit trip board with a schematic map, schedules, and live departures.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Bay Transit Board",
+    "description": "Bay Area trip planner with a schematic network map and real-time departures",
+    "category": "Transit",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "origin": "12TH",
+      "dest": "EMBR",
+      "useLocation": false
+    }
+  }
+}
