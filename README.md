@@ -4,6 +4,16 @@ An unofficial Omarchy bar plugin for planning trips and viewing live departures 
 
 Bay Transit Board is an independent project. It is not affiliated with, endorsed by, or an official application of the San Francisco Bay Area Rapid Transit District. It does not use the official BART logo or system map.
 
+## Screenshots
+
+### Direct route, parallel services, and Location
+
+![Bay Transit Board showing a direct trip from Lake Merritt to Embarcadero with the Location feature active](preview.png)
+
+### Suggested one-transfer route
+
+![Bay Transit Board showing a trip from Dublin/Pleasanton to Richmond with a transfer at Bay Fair](screenshots/transfer-route.png)
+
 ## Features
 
 - Click or search for a start and end station.
