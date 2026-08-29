@@ -26,7 +26,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import date, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from zoneinfo import ZoneInfo
 
 UA = "bay-transit-board/1.2 (+https://github.com/adg-ub/omarchy-bay-transit-board)"
@@ -40,15 +40,90 @@ STATE = Path.home() / ".local/state/omarchy/bay-transit-board"
 HERE = Path(__file__).resolve().parent
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
+KIB = 1024
+MIB = 1024 * KIB
+NETWORK_CHUNK_BYTES = 64 * KIB
+MAX_GTFS_DOWNLOAD_BYTES = 16 * MIB
+MAX_GTFS_ARCHIVE_ENTRIES = 64
+MAX_GTFS_EXPANDED_BYTES = 64 * MIB
+MAX_GTFS_ENTRY_BYTES = 32 * MIB
+MAX_GTFS_COMPRESSION_RATIO = 100
+MAX_GTFS_CACHE_BYTES = 64 * MIB
+MAX_RT_BYTES = 16 * MIB
+MAX_ALERT_BYTES = 2 * MIB
+MAX_RSS_BYTES = 2 * MIB
+MAX_LOCATION_BYTES = 64 * KIB
+MAX_CSV_FIELD_BYTES = 64 * KIB
 
-def get_bytes(url: str, timeout: int = 12) -> bytes:
+CSV_LIMITS = {
+    "routes.txt": (1 * MIB, 1_000),
+    "stops.txt": (2 * MIB, 5_000),
+    "trips.txt": (8 * MIB, 25_000),
+    "stop_times.txt": (16 * MIB, 250_000),
+    "calendar.txt": (2 * MIB, 5_000),
+    "calendar_dates.txt": (8 * MIB, 50_000),
+}
+REQUIRED_GTFS_FILES = frozenset(name for name in CSV_LIMITS if name != "calendar_dates.txt")
+
+
+class FeedLimitError(ValueError):
+    """A remote feed exceeded a configured safety boundary."""
+
+
+def _declared_length(resp) -> int | None:
+    value = resp.headers.get("Content-Length")
+    if value is None:
+        return None
+    try:
+        length = int(value)
+    except (TypeError, ValueError) as exc:
+        raise FeedLimitError("invalid Content-Length") from exc
+    if length < 0:
+        raise FeedLimitError("negative Content-Length")
+    return length
+
+
+def get_bytes(url: str, *, max_bytes: int, timeout: int = 12) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+        declared = _declared_length(resp)
+        if declared is not None and declared > max_bytes:
+            raise FeedLimitError(f"response exceeds {max_bytes} bytes")
+
+        payload = bytearray()
+        while len(payload) <= max_bytes:
+            remaining = max_bytes + 1 - len(payload)
+            chunk = resp.read(min(NETWORK_CHUNK_BYTES, remaining))
+            if not chunk:
+                return bytes(payload)
+            payload.extend(chunk)
+        raise FeedLimitError(f"response exceeds {max_bytes} bytes")
 
 
-def get_text(url: str, timeout: int = 12) -> str:
-    return get_bytes(url, timeout).decode("utf-8", "replace")
+def get_text(url: str, *, max_bytes: int, timeout: int = 12) -> str:
+    return get_bytes(url, max_bytes=max_bytes, timeout=timeout).decode("utf-8", "replace")
+
+
+def download_file(url: str, target: Path, *, max_bytes: int, timeout: int = 20) -> None:
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    written = 0
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, target.open("wb") as fh:
+            declared = _declared_length(resp)
+            if declared is not None and declared > max_bytes:
+                raise FeedLimitError(f"download exceeds {max_bytes} bytes")
+
+            while written <= max_bytes:
+                remaining = max_bytes + 1 - written
+                chunk = resp.read(min(NETWORK_CHUNK_BYTES, remaining))
+                if not chunk:
+                    return
+                fh.write(chunk)
+                written += len(chunk)
+            raise FeedLimitError(f"download exceeds {max_bytes} bytes")
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
 
 
 # ---- protobuf (stdlib) -------------------------------------------------------
@@ -189,109 +264,180 @@ def parse_rss(xml_text: str) -> list[str]:
 
 # ---- GTFS cache ---------------------------------------------------------------
 
-def _csv_rows(zf: zipfile.ZipFile, name: str) -> list[dict]:
-    with zf.open(name) as fh:
+def _validate_gtfs_archive(zf: zipfile.ZipFile) -> set[str]:
+    infos = zf.infolist()
+    if len(infos) > MAX_GTFS_ARCHIVE_ENTRIES:
+        raise FeedLimitError(f"GTFS archive has more than {MAX_GTFS_ARCHIVE_ENTRIES} entries")
+
+    names: set[str] = set()
+    expanded = 0
+    for info in infos:
+        path = PurePosixPath(info.filename)
+        if path.is_absolute() or ".." in path.parts:
+            raise FeedLimitError(f"unsafe GTFS entry path: {info.filename}")
+        if info.filename in names:
+            raise FeedLimitError(f"duplicate GTFS entry: {info.filename}")
+        names.add(info.filename)
+
+        if info.flag_bits & 0x1:
+            raise FeedLimitError(f"encrypted GTFS entry: {info.filename}")
+        if info.file_size > MAX_GTFS_ENTRY_BYTES:
+            raise FeedLimitError(f"GTFS entry exceeds {MAX_GTFS_ENTRY_BYTES} bytes: {info.filename}")
+        expanded += info.file_size
+        if expanded > MAX_GTFS_EXPANDED_BYTES:
+            raise FeedLimitError(f"GTFS archive expands beyond {MAX_GTFS_EXPANDED_BYTES} bytes")
+        if info.file_size and (
+            info.compress_size == 0
+            or info.file_size > info.compress_size * MAX_GTFS_COMPRESSION_RATIO
+        ):
+            raise FeedLimitError(f"suspicious compression ratio for GTFS entry: {info.filename}")
+
+    missing = REQUIRED_GTFS_FILES - names
+    if missing:
+        raise FeedLimitError(f"GTFS archive is missing: {', '.join(sorted(missing))}")
+    return names
+
+
+def _csv_rows(zf: zipfile.ZipFile, name: str):
+    max_bytes, max_rows = CSV_LIMITS[name]
+    info = zf.getinfo(name)
+    if info.file_size > max_bytes:
+        raise FeedLimitError(f"{name} exceeds {max_bytes} expanded bytes")
+
+    with zf.open(info) as fh:
         text = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
-        return list(csv.DictReader(text))
+        reader = csv.DictReader(text)
+        for count, row in enumerate(reader, start=1):
+            if count > max_rows:
+                raise FeedLimitError(f"{name} exceeds {max_rows} data rows")
+            yield row
 
 
 def parse_gtfs(zip_path: Path) -> dict:
+    if zip_path.stat().st_size > MAX_GTFS_DOWNLOAD_BYTES:
+        raise FeedLimitError(f"GTFS download exceeds {MAX_GTFS_DOWNLOAD_BYTES} bytes")
+
+    csv.field_size_limit(MAX_CSV_FIELD_BYTES)
     with zipfile.ZipFile(zip_path) as zf:
-        routes_raw = _csv_rows(zf, "routes.txt")
-        stops_raw = _csv_rows(zf, "stops.txt")
-        trips_raw = _csv_rows(zf, "trips.txt")
-        times_raw = _csv_rows(zf, "stop_times.txt")
-        cal_raw = _csv_rows(zf, "calendar.txt")
-        dates_raw = _csv_rows(zf, "calendar_dates.txt") if "calendar_dates.txt" in zf.namelist() else []
+        names = _validate_gtfs_archive(zf)
 
-    parent_of = {}
-    stations = []
-    for stop in stops_raw:
-        sid = stop["stop_id"]
-        parent = stop.get("parent_station") or ""
-        if stop.get("location_type") == "1":
-            stations.append({
-                "abbr": sid,
-                "name": stop["stop_name"],
-                "lat": float(stop["stop_lat"]),
-                "lon": float(stop["stop_lon"]),
+        parent_of = {}
+        stations = []
+        for stop in _csv_rows(zf, "stops.txt"):
+            sid = stop["stop_id"]
+            parent = stop.get("parent_station") or ""
+            if stop.get("location_type") == "1":
+                stations.append({
+                    "abbr": sid,
+                    "name": stop["stop_name"],
+                    "lat": float(stop["stop_lat"]),
+                    "lon": float(stop["stop_lon"]),
+                })
+                parent_of[sid] = sid
+            elif parent:
+                parent_of[sid] = parent
+            else:
+                parent_of[sid] = sid
+
+        routes = {}
+        for route in _csv_rows(zf, "routes.txt"):
+            rid = route["route_id"]
+            color = (route.get("route_color") or "888888").upper()
+            routes[rid] = {
+                "id": rid,
+                "name": route.get("route_short_name") or route.get("route_long_name") or rid,
+                "fullName": route.get("route_long_name") or "",
+                "hexcolor": "#" + color if not color.startswith("#") else color,
+            }
+
+        services = {}
+        for row in _csv_rows(zf, "calendar.txt"):
+            services[row["service_id"]] = {
+                "days": {day: row.get(day) == "1" for day in WEEKDAYS},
+                "start": row["start_date"],
+                "end": row["end_date"],
+                "added": set(),
+                "removed": set(),
+            }
+        if "calendar_dates.txt" in names:
+            for row in _csv_rows(zf, "calendar_dates.txt"):
+                sid = row["service_id"]
+                rec = services.setdefault(sid, {"days": {d: False for d in WEEKDAYS}, "start": "00000000", "end": "99999999", "added": set(), "removed": set()})
+                if row.get("exception_type") == "1":
+                    rec["added"].add(row["date"])
+                else:
+                    rec["removed"].add(row["date"])
+
+        times_by_trip: dict[str, list] = {}
+        for row in _csv_rows(zf, "stop_times.txt"):
+            times_by_trip.setdefault(row["trip_id"], []).append((
+                int(row["stop_sequence"] or 0),
+                parent_of.get(row["stop_id"], row["stop_id"]),
+                row["stop_id"],
+                row.get("departure_time") or row.get("arrival_time") or "",
+            ))
+        for trip_id, rows in times_by_trip.items():
+            rows.sort()
+            times_by_trip[trip_id] = [(abbr, stop_id, dep) for _, abbr, stop_id, dep in rows]
+
+        trips = []
+        for trip in _csv_rows(zf, "trips.txt"):
+            stops = times_by_trip.get(trip["trip_id"]) or []
+            if not stops:
+                continue
+            trips.append({
+                "id": trip["trip_id"],
+                "route": trip["route_id"],
+                "service": trip["service_id"],
+                "headsign": trip.get("trip_headsign") or "",
+                "stops": stops,
             })
-            parent_of[sid] = sid
-        elif parent:
-            parent_of[sid] = parent
-        else:
-            parent_of[sid] = sid
-
-    routes = {}
-    for route in routes_raw:
-        rid = route["route_id"]
-        color = (route.get("route_color") or "888888").upper()
-        routes[rid] = {
-            "id": rid,
-            "name": route.get("route_short_name") or route.get("route_long_name") or rid,
-            "fullName": route.get("route_long_name") or "",
-            "hexcolor": "#" + color if not color.startswith("#") else color,
-        }
-
-    services = {}
-    for row in cal_raw:
-        services[row["service_id"]] = {
-            "days": {day: row.get(day) == "1" for day in WEEKDAYS},
-            "start": row["start_date"],
-            "end": row["end_date"],
-            "added": set(),
-            "removed": set(),
-        }
-    for row in dates_raw:
-        sid = row["service_id"]
-        rec = services.setdefault(sid, {"days": {d: False for d in WEEKDAYS}, "start": "00000000", "end": "99999999", "added": set(), "removed": set()})
-        if row.get("exception_type") == "1":
-            rec["added"].add(row["date"])
-        else:
-            rec["removed"].add(row["date"])
-
-    times_by_trip: dict[str, list] = {}
-    for row in times_raw:
-        times_by_trip.setdefault(row["trip_id"], []).append((
-            int(row["stop_sequence"] or 0),
-            parent_of.get(row["stop_id"], row["stop_id"]),
-            row["stop_id"],
-            row.get("departure_time") or row.get("arrival_time") or "",
-        ))
-    for trip_id, rows in times_by_trip.items():
-        rows.sort()
-        times_by_trip[trip_id] = [(abbr, stop_id, dep) for _, abbr, stop_id, dep in rows]
-
-    trips = []
-    for trip in trips_raw:
-        stops = times_by_trip.get(trip["trip_id"]) or []
-        if not stops:
-            continue
-        trips.append({
-            "id": trip["trip_id"],
-            "route": trip["route_id"],
-            "service": trip["service_id"],
-            "headsign": trip.get("trip_headsign") or "",
-            "stops": stops,
-        })
 
     return {"stations": stations, "routes": routes, "services": services, "trips": trips}
+
+
+def _write_gtfs_cache(cache_path: Path, data: dict) -> None:
+    payload = pickle.dumps(data, protocol=4)
+    if len(payload) > MAX_GTFS_CACHE_BYTES:
+        raise FeedLimitError(f"parsed GTFS cache exceeds {MAX_GTFS_CACHE_BYTES} bytes")
+    temp_path = cache_path.with_suffix(".pkl.tmp")
+    try:
+        temp_path.write_bytes(payload)
+        os.replace(temp_path, cache_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def load_gtfs() -> dict:
     STATE.mkdir(parents=True, exist_ok=True)
     zip_path = STATE / "google_transit.zip"
     cache_path = STATE / "gtfs.pkl"
-    need = True
-    if zip_path.exists() and cache_path.exists():
-        age = time.time() - zip_path.stat().st_mtime
-        need = age > 12 * 3600
-    if need:
-        zip_path.write_bytes(get_bytes(GTFS_URL, timeout=20))
+    fresh = zip_path.exists() and time.time() - zip_path.stat().st_mtime <= 12 * 3600
+
+    if fresh and cache_path.exists() and cache_path.stat().st_size <= MAX_GTFS_CACHE_BYTES:
+        payload = cache_path.read_bytes()
+        if len(payload) <= MAX_GTFS_CACHE_BYTES:
+            return pickle.loads(payload)
+
+    if fresh:
         data = parse_gtfs(zip_path)
-        cache_path.write_bytes(pickle.dumps(data, protocol=4))
+        _write_gtfs_cache(cache_path, data)
         return data
-    return pickle.loads(cache_path.read_bytes())
+
+    temp_zip = zip_path.with_suffix(".zip.tmp")
+    try:
+        download_file(
+            GTFS_URL,
+            temp_zip,
+            max_bytes=MAX_GTFS_DOWNLOAD_BYTES,
+            timeout=20,
+        )
+        data = parse_gtfs(temp_zip)
+        _write_gtfs_cache(cache_path, data)
+        os.replace(temp_zip, zip_path)
+        return data
+    finally:
+        temp_zip.unlink(missing_ok=True)
 
 
 def hms_seconds(value: str) -> int:
@@ -323,7 +469,11 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
 
 def locate_ip():
     try:
-        data = json.loads(get_text("https://ipinfo.io/json", timeout=4))
+        data = json.loads(get_text(
+            "https://ipinfo.io/json",
+            max_bytes=MAX_LOCATION_BYTES,
+            timeout=4,
+        ))
         parts = str(data.get("loc") or "").split(",")
         if len(parts) != 2:
             return None
@@ -566,16 +716,28 @@ def main() -> int:
         advisories = []
         traincount = 0
         try:
-            advisories = parse_alerts(get_bytes(RT_ALERTS_URL, timeout=8))
+            advisories = parse_alerts(get_bytes(
+                RT_ALERTS_URL,
+                max_bytes=MAX_ALERT_BYTES,
+                timeout=8,
+            ))
         except Exception as exc:
             errors.append(f"alerts: {exc}")
         if not advisories:
             try:
-                advisories = parse_rss(get_text(RSS_URL, timeout=8))
+                advisories = parse_rss(get_text(
+                    RSS_URL,
+                    max_bytes=MAX_RSS_BYTES,
+                    timeout=8,
+                ))
             except Exception as exc:
                 errors.append(f"rss: {exc}")
         try:
-            traincount = len(parse_trip_updates(get_bytes(RT_TRIPS_URL, timeout=8)))
+            traincount = len(parse_trip_updates(get_bytes(
+                RT_TRIPS_URL,
+                max_bytes=MAX_RT_BYTES,
+                timeout=8,
+            )))
         except Exception:
             pass
         out.update({
@@ -609,16 +771,28 @@ def main() -> int:
     rt = {}
     advisories = []
     try:
-        rt = parse_trip_updates(get_bytes(RT_TRIPS_URL, timeout=8))
+        rt = parse_trip_updates(get_bytes(
+            RT_TRIPS_URL,
+            max_bytes=MAX_RT_BYTES,
+            timeout=8,
+        ))
     except Exception as exc:
         errors.append(f"gtfsrt: {exc}")
     try:
-        advisories = parse_alerts(get_bytes(RT_ALERTS_URL, timeout=8))
+        advisories = parse_alerts(get_bytes(
+            RT_ALERTS_URL,
+            max_bytes=MAX_ALERT_BYTES,
+            timeout=8,
+        ))
     except Exception as exc:
         errors.append(f"alerts: {exc}")
     if not advisories:
         try:
-            advisories = parse_rss(get_text(RSS_URL, timeout=8))
+            advisories = parse_rss(get_text(
+                RSS_URL,
+                max_bytes=MAX_RSS_BYTES,
+                timeout=8,
+            ))
         except Exception as exc:
             errors.append(f"rss: {exc}")
 
