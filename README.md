@@ -95,6 +95,8 @@ The origin station, destination station, and Location toggle are stored in your 
 
 The GTFS schedule is cached for up to 12 hours. Real-time data is retrieved during each refresh.
 
+All network responses have explicit byte limits. Before parsing, GTFS archives are checked for compressed size, entry count, paths, encryption, per-entry and total expanded size, compression ratio, CSV field size, and row count. Invalid feeds are rejected without replacing the last valid archive.
+
 ## License
 
 Plugin source code is licensed under the [MIT License](LICENSE). Transit data is owned by the San Francisco Bay Area Rapid Transit District and is used under its [Developer License Agreement](https://www.bart.gov/schedules/developers/developer-license-agreement). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
