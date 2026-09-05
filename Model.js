@@ -101,6 +101,7 @@ function emptySnapshot() {
     trips: [],
     departures: [],
     soonest: null,
+    transfer: null,
     advisories: [],
     traincount: 0,
     updated: "",
@@ -132,7 +133,10 @@ function barTooltip(snapshot) {
       return from + " → " + to + " · First train " + trips[0].depart
     return from + " → " + to
   }
-  return from + " → " + to + " · " + snapshot.soonest.dest + " · " + barMinute(snapshot.soonest.minutes)
+  var via = snapshot.transfer && snapshot.transfer.stationName
+    ? " · via " + snapshot.transfer.stationName
+    : ""
+  return from + " → " + to + via + " · " + snapshot.soonest.dest + " · " + barMinute(snapshot.soonest.minutes)
 }
 
 function updatedLabel(updated) {

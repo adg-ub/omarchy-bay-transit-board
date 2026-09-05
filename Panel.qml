@@ -89,6 +89,7 @@ Panel {
     return Model.advisoryLead(rows[0])
   }
   readonly property var soonest: snapshot && snapshot.soonest ? snapshot.soonest : null
+  readonly property var transfer: snapshot && snapshot.transfer ? snapshot.transfer : null
   readonly property var locationState: snapshot && snapshot.location
     ? snapshot.location
     : ({ ok: false, message: "Location unavailable" })
@@ -499,6 +500,21 @@ Panel {
                   color: root.dim
                   font.family: Style.font.menuFamily
                   font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+
+                Text {
+                  width: parent.width
+                  visible: !!root.transfer
+                  text: root.transfer
+                    ? "Transfer at " + root.transfer.stationName
+                      + " · " + root.transfer.waitMinutes + " min"
+                    : ""
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  font.family: Style.font.menuFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
                   wrapMode: Text.WordWrap
                 }
 

@@ -82,7 +82,7 @@ The following network requests are made:
 
 When Location is enabled, ipinfo.io returns an approximate city and latitude/longitude for the public IP. The plugin uses those coordinates locally to choose which of the two selected stations is closer. Location is approximate and may be inaccurate, especially on VPNs, mobile networks, or shared connections.
 
-The origin station, destination station, and Location toggle are stored in your local Omarchy Shell configuration. Downloaded GTFS data and a parsed cache are stored under `~/.local/state/omarchy/bay-transit-board/`. Approximate location coordinates are not written to the plugin cache.
+The origin station, destination station, and Location toggle are stored in your local Omarchy Shell configuration. Downloaded GTFS data and a non-executable JSON cache are stored under `~/.local/state/omarchy/bay-transit-board/`. Approximate location coordinates are not written to the plugin cache.
 
 ## Transit data
 
@@ -93,9 +93,33 @@ The origin station, destination station, and Location toggle are stored in your 
 | [GTFS-RT Alerts](https://api.bart.gov/gtfsrt/alerts.aspx) | Service advisories |
 | [Advisories RSS](https://www.bart.gov/schedules/advisories/advisories.xml) | Advisory fallback |
 
-The GTFS schedule is cached for up to 12 hours. Real-time data is retrieved during each refresh.
+The GTFS schedule is cached for up to 12 hours. If a refresh fails, a previously validated schedule may be used for up to seven days and the response reports that it is stale. Real-time data is retrieved during each refresh.
 
-All network responses have explicit byte limits. Before parsing, GTFS archives are checked for compressed size, entry count, paths, encryption, per-entry and total expanded size, compression ratio, CSV field size, and row count. Invalid feeds are rejected without replacing the last valid archive.
+All provider URLs require HTTPS. Redirects are limited to the same origin, and one whole-request deadline covers DNS lookup, connection setup, TLS, redirects, and body reads. Every network response has an explicit byte limit.
+
+Before parsing, GTFS archives are checked for compressed size, entry count, paths, encryption, per-entry and total expanded size, compression ratio, CSV field size, row count, field length, and derived-record count. Invalid feeds are rejected without replacing the last valid archive.
+
+The cache directory is opened component-by-component without following symlinks, restricted to the current user, and retained through descriptor-relative file operations. Cache and archive updates use unpredictable, exclusively created temporary files and atomic replacement. Cached files are bounded regular files owned by the current user, and the JSON cache is tied to the archive by SHA-256.
+
+Realtime entities, nested protobuf fields, alert strings, matching trips, displayed lines, departures, and final JSON output are also bounded before data reaches QML.
+
+## Development
+
+Run the standard-library test suite with:
+
+```sh
+python3 -m unittest discover -s tests -v
+omarchy plugin validate .
+```
+
+With `qmllint` installed, validate the QML against the active Omarchy shell:
+
+```sh
+qmllint -I "$OMARCHY_PATH/shell" \
+  BarWidget.qml Panel.qml NetworkMap.qml AlertCard.qml DestinationRow.qml
+```
+
+The Python tests cover network, archive, cache, filesystem, protobuf, routing, derived-cardinality, and serialized-output boundaries.
 
 ## License
 
