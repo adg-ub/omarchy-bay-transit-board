@@ -92,10 +92,11 @@ class NetworkLimitTests(unittest.TestCase):
     def test_cross_origin_redirect_is_refused(self):
         handler = fetch.SameOriginRedirectHandler()
         request = urllib.request.Request("https://example.test/feed")
+        response = FakeResponse(b"")
         with self.assertRaises(urllib.error.HTTPError) as raised:
             handler.redirect_request(
                 request,
-                None,
+                response,
                 302,
                 "Found",
                 Message(),
@@ -145,10 +146,11 @@ class NetworkLimitTests(unittest.TestCase):
     def test_redirect_to_different_port_is_refused(self):
         handler = fetch.SameOriginRedirectHandler()
         request = urllib.request.Request("https://example.test/feed")
+        response = FakeResponse(b"")
         with self.assertRaises(urllib.error.HTTPError) as raised:
             handler.redirect_request(
                 request,
-                None,
+                response,
                 302,
                 "Found",
                 Message(),
