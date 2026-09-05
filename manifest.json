@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.adg-ub.bay-transit-board",
   "name": "Bay Transit Board",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "Aditya Gupta",
   "license": "MIT",
   "description": "Unofficial Bay Area rapid-transit trip board with a schematic map, schedules, and live departures.",

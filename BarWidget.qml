@@ -24,6 +24,8 @@ BarWidget {
   property var snapshot: Model.emptySnapshot()
   property bool loading: false
   property string lastError: ""
+  property bool refreshPending: false
+  readonly property int maxPayloadCharacters: 262144
 
   readonly property string displayText: Model.barLabel(snapshot)
   readonly property string tooltip: Model.barTooltip(snapshot)
@@ -85,7 +87,10 @@ BarWidget {
   }
 
   function refresh() {
-    if (fetchProc.running) return
+    if (fetchProc.running) {
+      refreshPending = true
+      return
+    }
     loading = true
     var cmd = ["python3", pluginDir + "/fetch.py", origin || "-", dest || "-"]
     if (useLocation) cmd.push("--locate")
@@ -94,6 +99,16 @@ BarWidget {
   }
 
   function applyPayload(raw) {
+    if (!raw) {
+      lastError = "Transit data process returned no output"
+      loading = false
+      return
+    }
+    if (raw.length > maxPayloadCharacters) {
+      lastError = "Transit response exceeded the local output safety limit"
+      loading = false
+      return
+    }
     try {
       var parsed = JSON.parse(raw)
       snapshot = parsed
@@ -145,6 +160,12 @@ BarWidget {
 
   Process {
     id: fetchProc
+    onRunningChanged: {
+      if (!running && root.refreshPending) {
+        root.refreshPending = false
+        Qt.callLater(root.refresh)
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyPayload(String(text || "").trim())
